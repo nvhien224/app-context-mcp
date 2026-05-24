@@ -1,66 +1,88 @@
+"""
+Fast in-memory LRU cache for App Context MCP.
+No dependency; pure stdlib.
+"""
+
 from __future__ import annotations
 
-import hashlib
-import json
+import threading
 import time
-from pathlib import Path
-from typing import Any
+from collections import OrderedDict
+from dataclasses import dataclass, field
 
 
-class IndexCache:
-    """Content-addressable cache for Semble index + CodeGraph.
+@dataclass
+class CacheEntry:
+    value: object
+    expire_at: float = 0.0
+    hits: int = 0
 
-    Arkon pattern: compute SHA256(content) → skip re-index khi code không đổi.
-    Cache persist tại .app-context-cache/ trong repo.
+
+class Cache:
+    """Thread-safe LRU cache with TTL support.
+    Use for: repo_index, search_results, project_info.
     """
 
-    def __init__(self, repo_path: str | Path):
-        self.repo = Path(repo_path).resolve()
-        self.cache_dir = self.repo / ".app-context-cache"
-        self.cache_dir.mkdir(exist_ok=True)
-        self._index_hash_file = self.cache_dir / "index_hash.txt"
-        self._index_file = self.cache_dir / "semble_index.pkl"
-        self._codegraph_file = self.cache_dir / "code_graph.json"
+    def __init__(self, maxsize: int = 64, default_ttl: float = 300.0) -> None:
+        self._maxsize = maxsize
+        self._default_ttl = default_ttl
+        self._lock = threading.RLock()
+        self._store: OrderedDict[str, CacheEntry] = OrderedDict()
 
-    def _compute_repo_hash(self) -> str:
-        """Walk all .dart, .json, .yaml files → mtime+size hash.
+    def get(self, key: str) -> object | None:
+        with self._lock:
+            entry = self._store.get(key)
+            if entry is None:
+                return None
+            if 0 < entry.expire_at < time.monotonic():
+                del self._store[key]
+                return None
+            entry.hits += 1
+            self._store.move_to_end(key)
+            return entry.value
 
-        Quicker nhanh hơn content hash, đủ detect bất kỳ thay đổi.
-        """
-        h = hashlib.sha256()
-        for suffix in (".dart", ".yaml", ".yml", ".json", ".md"):
-            for f in sorted(self.repo.rglob(f"*{suffix}")):
-                try:
-                    stat = f.stat()
-                    h.update(f"{f}:{stat.st_mtime}:{stat.st_size}\n".encode())
-                except OSError:
-                    pass
-        return h.hexdigest()
+    def set(self, key: str, value: object, ttl: float | None = None) -> None:
+        expire = time.monotonic() + (ttl or self._default_ttl)
+        with self._lock:
+            if key in self._store:
+                self._store.move_to_end(key)
+            self._store[key] = CacheEntry(value=value, expire_at=expire)
+            while len(self._store) > self._maxsize:
+                self._store.popitem(last=False)
 
-    def is_fresh(self) -> bool:
-        """Return True nếu cache còn valid (repo không đổi)."""
-        if not self._index_hash_file.exists():
-            return False
-        current = self._compute_repo_hash()
-        stored = self._index_hash_file.read_text().strip()
-        return current == stored
+    def invalidate(self, key: str | None = None, prefix: str | None = None) -> int:
+        """Remove by exact key or prefix. Returns count removed."""
+        with self._lock:
+            if key is not None and key in self._store:
+                del self._store[key]
+                return 1
+            if prefix is not None:
+                removed = 0
+                for k in list(self._store.keys()):
+                    if k.startswith(prefix):
+                        del self._store[k]
+                        removed += 1
+                return removed
+            return 0
 
-    def save_index_meta(self, index: Any, codegraph: dict[str, Any] | None) -> None:
-        """Persist cache metadata sau khi index thành công."""
-        self._index_hash_file.write_text(self._compute_repo_hash(), encoding="utf-8")
-        # Semble index có save riêng. CodeGraph JSON persist nhẹ.
-        if codegraph:
-            self._codegraph_file.write_text(
-                json.dumps(codegraph, ensure_ascii=False, indent=2),
-                encoding="utf-8",
-            )
+    def stats(self) -> dict[str, int | float]:
+        with self._lock:
+            total_hits = sum(e.hits for e in self._store.values())
+            return {
+                "size": len(self._store),
+                "maxsize": self._maxsize,
+                "total_hits": total_hits,
+            }
 
-    def load_codegraph(self) -> dict[str, Any] | None:
-        if self._codegraph_file.exists():
-            return json.loads(self._codegraph_file.read_text(encoding="utf-8"))
-        return None
 
-    def clear(self) -> None:
-        """Force invalidate."""
-        for f in [self._index_hash_file, self._index_file, self._codegraph_file]:
-            f.unlink(missing_ok=True)
+# Singletons — imported by server/context
+_repo_cache: Cache = Cache(maxsize=16, default_ttl=60.0)   # short TTL: index may change
+_search_cache: Cache = Cache(maxsize=128, default_ttl=30.0)  # very short: cheap to recompute
+
+
+def repo_cache() -> Cache:
+    return _repo_cache
+
+
+def search_cache() -> Cache:
+    return _search_cache

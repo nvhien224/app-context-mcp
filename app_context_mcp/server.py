@@ -140,24 +140,44 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> Any:
         user_role: str | None = None,
         desired_behavior: str | None = None,
         max_results: int = 20,
+        token_budget: int | None = None,
     ) -> dict[str, Any]:
         """Return a structured evidence/context pack about a Flutter codebase.
 
         Truy vấn tuyệt đối cho: màn hình Flutter, logic ẩn/hiện nút,
         API endpoint/field, condition tại sao UI disable, workaround cho BE.
         """
+        # ── Strict input validation ──
+        repo_p = Path(repo_path)
+        if not repo_p.exists() or not repo_p.is_dir():
+            return {
+                "status": "error",
+                "error": f"repo_path '{repo_path}' does not exist or is not a directory.",
+            }
+        if not isinstance(question, str) or not question.strip():
+            return {
+                "status": "error",
+                "error": "question must be a non-empty string.",
+            }
+        if not isinstance(max_results, int) or max_results < 1:
+            max_results = 10
+        elif max_results > 200:
+            max_results = 200  # hard cap
+
+        q = question.strip()[:2000]
         t0 = time.perf_counter()
         status = "ok"
         error = None
         result: dict[str, Any] = {}
         try:
             result = ask_app_context(
-                repo_path=repo_path,
-                question=question,
+                repo_path=repo_p,
+                question=q,
                 screenshot_text=screenshot_text,
                 user_role=user_role,
                 desired_behavior=desired_behavior,
                 max_results=max_results,
+                token_budget=token_budget,
             )
             status = result.get("status", "ok")
         except Exception as exc:
@@ -166,7 +186,7 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> Any:
             result = {"status": "error", "error": error}
 
         latency_ms = (time.perf_counter() - t0) * 1000
-        _log_call("ask_app_context_tool", repo_path, question, latency_ms, status, error)
+        _log_call("ask_app_context_tool", str(repo_p), q, latency_ms, status, error)
         return result
 
     return mcp

@@ -1,10 +1,20 @@
 from __future__ import annotations
+from app_context_mcp.retrieval import SembleRetrieval
 
+from .code_graph import build_code_graph
+from .indexer import build_index, git_info
+from .models import AppIndex, Evidence
+
+
+
+
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app_context_mcp.retrieval import SembleRetrieval
+from app_context_mcp.cache import repo_cache, search_cache
 
 from .code_graph import build_code_graph
 from .indexer import build_index, git_info
@@ -19,28 +29,43 @@ def ask_app_context(
     desired_behavior: str | None = None,
     max_results: int = 20,
     use_semble: bool = True,
+    token_budget: int | None = None,
 ) -> dict[str, Any]:
-    # Optional Semble pre-filter: limit scope to ranked candidate files
-    semble_candidates: list[str] | None = None
-    q = f"{question} {screenshot_text or ''} {desired_behavior or ''}".strip()
-    if use_semble:
-        try:
-            sr = SembleRetrieval()
-            sr.index_repo(repo_path)
-            semble_candidates = sr.rank_files(q, top_k=max_results)
-        except Exception:
-            semble_candidates = None
+    repo = Path(repo_path).resolve()
+    cache_key = f"idx:{repo}:{repo.stat().st_mtime if repo.exists() else 0}"
 
-    index = build_index(repo_path, semble_candidate_files=semble_candidates)
+    # ── L1 cache: in-memory hot index ──
+    index = repo_cache().get(cache_key)
+    if index is None:
+        semble_candidates = None
+        q = f"{question} {screenshot_text or ''} {desired_behavior or ''}".strip()
+        if use_semble:
+            try:
+                sr = SembleRetrieval()
+                sr.index_repo(repo)
+                semble_candidates = sr.rank_files(q, top_k=max_results)
+            except Exception:
+                semble_candidates = None
+        index = build_index(repo, semble_candidate_files=semble_candidates)
+        repo_cache().set(cache_key, index, ttl=60.0)
+
     role = user_role or "NON_TECH"
     query_text = " ".join(part for part in [question, screenshot_text, desired_behavior] if part).lower()
-    intents = detect_intents(query_text)
 
+    # ── L2 cache: search query cache (very short TTL) ──
+    search_key = f"srch:{repo}:{query_text[:80]}"
+    cached_result = search_cache().get(search_key)
+    if cached_result is not None:
+        result = dict(cached_result)
+        result["cached"] = True
+        return result
+
+    intents = detect_intents(query_text)
     screen_candidates = rank_screens(index, query_text, max_results=max_results)
     condition_hits = rank_conditions(index, query_text, max_results=max_results)
     api_hits = rank_apis(index, query_text, max_results=max_results)
     field_hits = rank_fields(index, query_text, max_results=max_results)
-    semble_evidence = {"used": use_semble and bool(semble_candidates), "candidate_files": semble_candidates or []}
+    semble_evidence = {"used": use_semble, "candidate_files": []}
 
     evidence_ids: set[str] = set()
     for item in screen_candidates:
@@ -55,6 +80,10 @@ def ask_app_context(
     status = decide_status(screen_candidates, condition_hits, api_hits, field_hits)
     unknowns = build_unknowns(status, screenshot_text, api_hits)
     evidence_registry = [evidence_to_dict(index.evidence[eid]) for eid in sorted(evidence_ids) if eid in index.evidence]
+
+    # Token budget clamping
+    if token_budget is not None:
+        evidence_registry = _clamp_evidence_token(evidence_registry, token_budget)
 
     result: dict[str, Any] = {
         "status": status,
@@ -79,16 +108,33 @@ def ask_app_context(
         "evidence_registry": evidence_registry,
         "unknowns_and_limits": unknowns,
         "index_info": build_index_info(index),
-        "search_info": {**semble_evidence, "query": q},
+        "search_info": {**semble_evidence, "query": query_text[:200]},
         "code_graph": build_code_graph(index).export(),
-        # ── GitNexus-inspired additions ──
         "import_graph": build_import_graph(index),
         "execution_flows": build_execution_flows(index, screen_candidates),
         "impact_analysis": build_impact_analysis(index, screen_candidates, condition_hits, api_hits),
+        "_cached": False,
     }
+
+    # Cache search result for 30s
+    search_cache().set(search_key, dict(result), ttl=30.0)
     return result
 
 
+def _clamp_evidence_token(registry: list[dict], budget: int) -> list[dict]:
+    """Clamp evidence registry to not exceed token budget."""
+    max_chars = budget * 3
+    total = 0
+    out = []
+    for ev in registry:
+        ev_copy = dict(ev)
+        ev_copy["snippet"] = ev_copy.get("snippet", "")[:800]
+        size = len(json.dumps(ev_copy))
+        if total + size > max_chars:
+            break
+        total += size
+        out.append(ev_copy)
+    return out
 def detect_intents(text: str) -> list[str]:
     intents = []
     if any(k in text for k in ["màn", "screen", "route", "page"]):
