@@ -194,34 +194,21 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> Any:
 
 
 def _wrap_streamable_http_app(mcp_app: Any) -> Any:
-    """Wrap streamable_http_app to redirect / → /mcp for Claude Desktop compatibility.
+    """Deprecated: kept for compatibility but not used at runtime.
 
-    Claude Desktop dùng SSE mode (/sse endpoint). Nếu dùng streamable-http
-    mode (/mcp endpoint), Claude Desktop sẽ POST / → 404 vì nó không tự
-    discovery /mcp.
-
-    Fix: wrapper redirect / và /register → /mcp, mount MCP app at /mcp và /.
+    FastMCP streamable_http_app() requires lifespan init từ .run().
+    Khi mount qua uvicorn trước khi .run() gọi = Task group not initialized.
+    Claude Desktop chỉ hỗ trợ SSE (/sse) — không hỗ trợ streamable-http.
     """
-    from starlette.applications import Starlette
-    from starlette.requests import Request
-    from starlette.responses import RedirectResponse
-    from starlette.routing import Route
+    return mcp_app  # passthrough — không mount wrapper gây lỗi
 
-    async def root_redirect(request: Request) -> RedirectResponse:
-        return RedirectResponse(url="/mcp", status_code=307)
 
-    wrapper = Starlette(
-        routes=[
-            Route("/", endpoint=root_redirect, methods=["GET", "POST"]),
-            Route("/register", endpoint=root_redirect, methods=["GET", "POST"]),
-        ]
+def _log_transport_switch(requested: str, actual: str) -> None:
+    import logging
+    logging.getLogger("app-context-mcp").warning(
+        f"Transport '{requested}' không khả thi với uvicorn lifespan — auto-switch sang '{actual}'. "
+        f"Claude Desktop chỉ hỗ trợ SSE (/sse). URL: https://host:port/sse"
     )
-    # Mount the actual MCP app at /mcp — FastMCP streamable_http_app already handles /mcp
-    # But some versions mount at root; guard with a fallback mount
-    wrapper.mount("/mcp", mcp_app)
-    # Also mount at root as catch-all for anything not caught above
-    wrapper.mount("/", mcp_app)
-    return wrapper
 
 
 def run_https_server(
@@ -236,6 +223,12 @@ def run_https_server(
     """FastMCP SSE/HTTP with uvicorn TLS."""
     if transport == "stdio":
         raise SystemExit("HTTPS is only valid for sse or streamable-http transports, not stdio.")
+
+    # Issue #8: streamable_http_app() chưa init task group khi mount → crash.
+    # Claude Desktop chỉ dùng SSE (/sse) — auto-switch.
+    if transport == "streamable-http":
+        _log_transport_switch("streamable-http", "sse")
+        transport = "sse"
 
     certfile = ssl_certfile
     keyfile = ssl_keyfile
@@ -252,12 +245,8 @@ def run_https_server(
 
     import uvicorn
 
-    if transport == "sse":
-        app = server.sse_app()
-    elif transport == "streamable-http":
-        app = _wrap_streamable_http_app(server.streamable_http_app())
-    else:
-        raise SystemExit(f"Unsupported HTTPS transport: {transport}")
+    # Chỉ dùng sse_app() — streamable_http_app() không hoạt động với uvicorn TLS
+    app = server.sse_app()
 
     uvicorn.run(
         app,
@@ -273,16 +262,10 @@ def run_https_server(
 
 
 def _wrap_http_run(server: Any, transport: str, host: str, port: int) -> None:
-    """Wrap server.run() for streamable-http redirect support (non-HTTPS path)."""
+    """Auto-switch streamable-http → SSE (issue #8: task group not initialized)."""
     if transport == "streamable-http":
-        try:
-            # FastMCP.run() with streamable-http may use uvicorn directly
-            import uvicorn
-            app = _wrap_streamable_http_app(server.streamable_http_app())
-            uvicorn.run(app, host=host, port=port, log_level="info")
-            return
-        except Exception:
-            pass  # fallback to server.run()
+        _log_transport_switch("streamable-http", "sse")
+        transport = "sse"
     server.run(transport=transport, host=host, port=port)
 
 
