@@ -70,6 +70,7 @@ def _parse_single_file(file: Path, repo: Path) -> dict[str, Any]:
     lines = text.splitlines()
     classes = CLASS_RE.findall(text)
     current_class = classes[0] if classes else file.stem
+    rel = str(file.relative_to(repo))
 
     parsed: dict[str, Any] = {"screens": [], "api_calls": [], "fields": [], "conditions": [], "evidence": [], "hooks": [], "riverpod_reads": [], "annotations": [], "localizations": [], "model_annotations": []}
     ev_counter = [0]
@@ -117,32 +118,38 @@ def _parse_single_file(file: Path, repo: Path) -> dict[str, Any]:
     for m in HOOK_RE.finditer(text):
         hook_name = m.group(1)
         ln = _line_no(text, m.start())
-        parsed["hooks"].append({"name": hook_name, "line": ln, "evidence_id": add_ev("code", hook_name, ln, _snippet(text, m.start()), f"Flutter hook: {hook_name}")})
+        parsed["hooks"].append({"name": hook_name, "line": ln, "file": rel,
+                                 "evidence_id": add_ev("code", hook_name, ln, _snippet(text, m.start()), f"Flutter hook: {hook_name}")})
 
     # Riverpod ref.read/watch/listen
     for m in RIVERPOD_RE.finditer(text):
         access_type = m.group(1)
         ln = _line_no(text, m.start())
-        parsed["riverpod_reads"].append({"access_type": access_type, "line": ln, "evidence_id": add_ev("code", f"ref.{access_type}", ln, _snippet(text, m.start()), f"Riverpod ref.{access_type}")})
+        parsed["riverpod_reads"].append({"access_type": access_type, "line": ln, "file": rel,
+                                         "evidence_id": add_ev("code", f"ref.{access_type}", ln, _snippet(text, m.start()), f"Riverpod ref.{access_type}")})
 
     # AutoRoute annotations
     for m in AUTOROUTE_RE.finditer(text):
         ln = _line_no(text, m.start())
-        parsed["annotations"].append({"kind": "AutoRoute", "line": ln, "evidence_id": add_ev("code", "@RoutePage", ln, _snippet(text, m.start(), 2), "AutoRoute page annotation")})
+        parsed["annotations"].append({"kind": "AutoRoute", "line": ln, "file": rel,
+                                      "evidence_id": add_ev("code", "@RoutePage", ln, _snippet(text, m.start(), 2), "AutoRoute page annotation")})
 
     # Localization .tr
     for m in TR_RE.finditer(text):
         ln = _line_no(text, m.start())
         raw = m.group(0)
-        parsed["localizations"].append({"key": raw, "line": ln, "evidence_id": add_ev("code", "localization", ln, _snippet(text, m.start()), "Localization key with .tr")})
+        parsed["localizations"].append({"key": raw, "line": ln, "file": rel,
+                                         "evidence_id": add_ev("code", "localization", ln, _snippet(text, m.start()), "Localization key with .tr")})
 
     # @freezed / @JsonSerializable models
     for m in FREEZED_RE.finditer(text):
         ln = _line_no(text, m.start())
-        parsed["model_annotations"].append({"kind": "freezed", "line": ln, "evidence_id": add_ev("code", "@freezed", ln, _snippet(text, m.start(), 3), "Freezed model annotation")})
+        parsed["model_annotations"].append({"kind": "freezed", "line": ln, "file": rel,
+                                             "evidence_id": add_ev("code", "@freezed", ln, _snippet(text, m.start(), 3), "Freezed model annotation")})
     for m in JSON_SERIAL_RE.finditer(text):
         ln = _line_no(text, m.start())
-        parsed["model_annotations"].append({"kind": "JsonSerializable", "line": ln, "evidence_id": add_ev("code", "@JsonSerializable", ln, _snippet(text, m.start(), 3), "JsonSerializable model annotation")})
+        parsed["model_annotations"].append({"kind": "JsonSerializable", "line": ln, "file": rel,
+                                             "evidence_id": add_ev("code", "@JsonSerializable", ln, _snippet(text, m.start(), 3), "JsonSerializable model annotation")})
 
     # JSON fields (all patterns with json['key'])
     _seen = set()
@@ -242,6 +249,13 @@ def build_index(
         for e in parsed.get("evidence", []):
             index.evidence[e["id"]] = Evidence(id=e["id"], source_type=e["source_type"], file=rel,
                                                   symbol=e["symbol"], lines=str(e["line"]), snippet=e["snippet"], why_relevant=e["why"])
+        # New patterns
+        for h in parsed.get("hooks", []):
+            index.hooks.append(h)
+        for ann in parsed.get("annotations", []):
+            index.annotations.append(ann)
+        for ma in parsed.get("model_annotations", []):
+            index.model_annotations.append(ma)
 
     db.execute("INSERT OR REPLACE INTO repo_meta(repo_path, last_scan_ts, dart_files) VALUES (?,?,?)",
                (str(repo), datetime.now(timezone.utc).isoformat(), len(dart_files)))

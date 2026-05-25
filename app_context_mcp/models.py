@@ -124,3 +124,7 @@ class AppIndex:
     import_graph: dict[str, set[str]] = field(default_factory=dict)
     # reverse: file → set of files that import this file
     import_graph_reverse: dict[str, set[str]] = field(default_factory=dict)
+    # hooks / annotations / models (lightweight)
+    hooks: list[dict] = field(default_factory=list)
+    annotations: list[dict] = field(default_factory=list)
+    model_annotations: list[dict] = field(default_factory=list)

@@ -1,22 +1,17 @@
 from __future__ import annotations
 from app_context_mcp.retrieval import SembleRetrieval
 
+from .cache import repo_cache, _get_search_cache
 from .code_graph import build_code_graph
 from .graph_retrieval import build_graph_evidence_pack
 from .indexer import build_index, git_info
 from .models import AppIndex, Evidence
-
-
-
-
+from .rag_index import RAGIndex
 import hashlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
-from app_context_mcp.retrieval import SembleRetrieval
-from .cache import repo_cache, search_cache
 
 
 def ask_app_context(
@@ -55,7 +50,8 @@ def ask_app_context(
     git_sha = info.get("git_commit") or ""
     git_branch = info.get("git_branch") or ""
     search_key = f"srch:{repo}:{hashlib.md5((query_text[:160] + git_sha + git_branch).encode()).hexdigest()}"
-    cached_result = search_cache().get(search_key)
+    sc = _get_search_cache(db_path=str(repo / ".app-context-cache.db"))
+    cached_result = sc.get(search_key)
     if cached_result is not None:
         result = dict(cached_result)
         result["_cached"] = True
@@ -129,7 +125,8 @@ def ask_app_context(
     result["_cached"] = False
 
     # Cache search result for 30s — invalidated on git commit/branch change
-    search_cache().set(search_key, dict(result), ttl=30.0)
+    sc = _get_search_cache(db_path=str(repo / ".app-context-cache.db"))
+    sc.set(search_key, dict(result), ttl=30.0)
     return result
 
 
