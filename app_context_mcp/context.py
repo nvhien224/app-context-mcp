@@ -2,6 +2,7 @@ from __future__ import annotations
 from app_context_mcp.retrieval import SembleRetrieval
 
 from .code_graph import build_code_graph
+from .graph_retrieval import build_graph_evidence_pack
 from .indexer import build_index, git_info
 from .models import AppIndex, Evidence
 
@@ -15,10 +16,6 @@ from typing import Any
 
 from app_context_mcp.retrieval import SembleRetrieval
 from app_context_mcp.cache import repo_cache, search_cache
-
-from .code_graph import build_code_graph
-from .indexer import build_index, git_info
-from .models import AppIndex, Evidence
 
 
 def ask_app_context(
@@ -110,6 +107,7 @@ def ask_app_context(
         "index_info": build_index_info(index),
         "search_info": {**semble_evidence, "query": query_text[:200]},
         "code_graph": build_code_graph(index).export(),
+        "graph_evidence_pack": build_graph_evidence_pack(index, screen_candidates, condition_hits, api_hits, field_hits),
         "import_graph": build_import_graph(index),
         "execution_flows": build_execution_flows(index, screen_candidates),
         "impact_analysis": build_impact_analysis(index, screen_candidates, condition_hits, api_hits),

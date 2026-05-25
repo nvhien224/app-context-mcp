@@ -40,6 +40,71 @@ class CodeGraph:
     def predecessors(self, node_id: str) -> list[tuple[str, str]]:
         return [(frm, rel) for frm, to_id, rel in self.edges if to_id == node_id]
 
+
+    def bfs_expand(self, seed_nodes: set[str], depth: int = 2) -> dict[str, Any]:
+        """Graph-traverse from seed nodes — BFS expansion with relation tracking."""
+        from collections import deque
+        visited: set[str] = set()
+        frontier = set(seed_nodes)
+        layers: list[list[dict]] = []
+        for _ in range(depth):
+            if not frontier:
+                break
+            next_frontier: set[str] = set()
+            layer_hits = []
+            for node in frontier:
+                if node in visited:
+                    continue
+                visited.add(node)
+                for to, rel in self.neighbors(node):
+                    next_frontier.add(to)
+                    layer_hits.append({"from": node, "to": to, "relation": rel})
+                for frm, rel in self.predecessors(node):
+                    next_frontier.add(frm)
+                    layer_hits.append({"from": frm, "to": node, "relation": rel})
+            layers.append(layer_hits)
+            frontier = next_frontier - visited
+        node_snapshots = {nid: {"id": self.nodes[nid].node_id, "type": self.nodes[nid].node_type, "label": self.nodes[nid].label} for nid in visited if nid in self.nodes}
+        return {"layers": layers, "nodes": node_snapshots, "total_visited": len(visited)}
+
+    def trace_path(self, start_id: str, end_id: str) -> list[dict] | None:
+        """Shortest path (BFS) from start to end node."""
+        if start_id not in self.nodes or end_id not in self.nodes:
+            return None
+        from collections import deque
+        queue = deque([[start_id]])
+        seen = {start_id}
+        while queue:
+            path = queue.popleft()
+            last = path[-1]
+            if last == end_id:
+                return [{"node": self.nodes[n].label, "id": n} for n in path]
+            for to, rel in self.neighbors(last):
+                if to not in seen:
+                    seen.add(to)
+                    queue.append(path + [to])
+        return None
+
+    def feature_clusters(self) -> list[dict[str, Any]]:
+        """Group connected components into feature-like clusters."""
+        comps = self.connected_components()
+        clusters = []
+        for i, comp in enumerate(comps[:30]):
+            screens = sorted([self.nodes[n].label for n in comp if n.startswith("screen:")])
+            apis = sorted({self.nodes[n].label for n in comp if n.startswith("api:")})
+            fields = sorted({self.nodes[n].extra.get("raw_json_field", self.nodes[n].label) for n in comp if n.startswith("field:")})
+            conditions = sorted({self.nodes[n].label for n in comp if n.startswith("condition:")})
+            label = screens[0] if screens else (conditions[0] if conditions else f"cluster_{i}")
+            clusters.append({
+                "id": f"cluster_{i:03d}",
+                "label": label,
+                "node_count": len(comp),
+                "screens": screens[:5],
+                "apis": apis[:5],
+                "fields": fields[:5],
+                "conditions": conditions[:5],
+            })
+        return clusters
     def connected_components(self) -> list[set[str]]:
         adj: dict[str, set[str]] = defaultdict(set)
         for frm, to_id, _ in self.edges:
