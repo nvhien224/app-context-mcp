@@ -22,6 +22,14 @@ TEXT_RE = re.compile(r"Text\s*\(\s*['\"]([^'\"]{1,200})['\"]\s*\)")
 CLIENT_RE = re.compile(r"client\.(get|post|put|delete|patch)\(\s*['\"]([^'\"]+)['\"]")
 METHOD_RE = re.compile(r"(?:Future<[^>]+>|Future<void>|[\w<>?,\s]+)\s+(\w+)\s*\([^)]*\)\s*(?:async\s*)?\{")
 VISIBILITY_RE = re.compile(r"(?:enabled|visible)\s*:\s*([^,\)\}]+)")
+# Flutter framework patterns (Dio, hooks, Riverpod, AutoRoute, localization)
+DIO_RE = re.compile(r"dio\.(get|post|put|delete|patch)\("+r"\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
+HOOK_RE = re.compile(r"(useQuery|useMutation|useFuture|useMemoized)\s*\(")
+RIVERPOD_RE = re.compile(r"ref\.(read|watch|listen)\s*\(")
+AUTOROUTE_RE = re.compile(r"(@RoutePage)\s*\(")
+TR_RE = re.compile(r'([\'\"].*?[\'\"])\.tr\b', re.IGNORECASE)
+FREEZED_RE = re.compile(r"(@freezed)\b")
+JSON_SERIAL_RE = re.compile(r"(@JsonSerializable)\b")
 IDENT_RE = re.compile(r"\b\w+\b")
 
 def _hash_file(path: Path) -> str:
@@ -63,7 +71,7 @@ def _parse_single_file(file: Path, repo: Path) -> dict[str, Any]:
     classes = CLASS_RE.findall(text)
     current_class = classes[0] if classes else file.stem
 
-    parsed: dict[str, Any] = {"screens": [], "api_calls": [], "fields": [], "conditions": [], "evidence": []}
+    parsed: dict[str, Any] = {"screens": [], "api_calls": [], "fields": [], "conditions": [], "evidence": [], "hooks": [], "riverpod_reads": [], "annotations": [], "localizations": [], "model_annotations": []}
     ev_counter = [0]
 
     def add_ev(source_type: str, symbol: str, line: int, snippet_text: str, why: str) -> str:
@@ -89,13 +97,52 @@ def _parse_single_file(file: Path, repo: Path) -> dict[str, Any]:
     for m in METHOD_RE.finditer(text):
         method_spans.append((m.start(), m.group(1)))
 
-    # API calls
+    # API calls (client.*)
     for m in CLIENT_RE.finditer(text):
         method = m.group(1).upper()
         path_tmpl = normalize_path_template(m.group(2))
         ln = _line_no(text, m.start())
         client_method = _nearest(method_spans, m.start()) or current_class
         parsed["api_calls"].append({"method": method, "path": path_tmpl, "client_method": client_method, "line": ln, "evidence_id": add_ev("code", client_method, ln, _snippet(text, m.start()), "Client API call")})
+
+    # Dio calls
+    for m in DIO_RE.finditer(text):
+        method = m.group(1).upper()
+        path_tmpl = normalize_path_template(m.group(2))
+        ln = _line_no(text, m.start())
+        caller = _nearest(method_spans, m.start()) or current_class
+        parsed["api_calls"].append({"method": method, "path": path_tmpl, "client_method": caller, "line": ln, "evidence_id": add_ev("code", caller, ln, _snippet(text, m.start()), "Dio API call")})
+
+    # Hooks
+    for m in HOOK_RE.finditer(text):
+        hook_name = m.group(1)
+        ln = _line_no(text, m.start())
+        parsed["hooks"].append({"name": hook_name, "line": ln, "evidence_id": add_ev("code", hook_name, ln, _snippet(text, m.start()), f"Flutter hook: {hook_name}")})
+
+    # Riverpod ref.read/watch/listen
+    for m in RIVERPOD_RE.finditer(text):
+        access_type = m.group(1)
+        ln = _line_no(text, m.start())
+        parsed["riverpod_reads"].append({"access_type": access_type, "line": ln, "evidence_id": add_ev("code", f"ref.{access_type}", ln, _snippet(text, m.start()), f"Riverpod ref.{access_type}")})
+
+    # AutoRoute annotations
+    for m in AUTOROUTE_RE.finditer(text):
+        ln = _line_no(text, m.start())
+        parsed["annotations"].append({"kind": "AutoRoute", "line": ln, "evidence_id": add_ev("code", "@RoutePage", ln, _snippet(text, m.start(), 2), "AutoRoute page annotation")})
+
+    # Localization .tr
+    for m in TR_RE.finditer(text):
+        ln = _line_no(text, m.start())
+        raw = m.group(0)
+        parsed["localizations"].append({"key": raw, "line": ln, "evidence_id": add_ev("code", "localization", ln, _snippet(text, m.start()), "Localization key with .tr")})
+
+    # @freezed / @JsonSerializable models
+    for m in FREEZED_RE.finditer(text):
+        ln = _line_no(text, m.start())
+        parsed["model_annotations"].append({"kind": "freezed", "line": ln, "evidence_id": add_ev("code", "@freezed", ln, _snippet(text, m.start(), 3), "Freezed model annotation")})
+    for m in JSON_SERIAL_RE.finditer(text):
+        ln = _line_no(text, m.start())
+        parsed["model_annotations"].append({"kind": "JsonSerializable", "line": ln, "evidence_id": add_ev("code", "@JsonSerializable", ln, _snippet(text, m.start(), 3), "JsonSerializable model annotation")})
 
     # JSON fields (all patterns with json['key'])
     _seen = set()

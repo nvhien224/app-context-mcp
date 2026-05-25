@@ -9,13 +9,14 @@ from .models import AppIndex, Evidence
 
 
 
+import hashlib
 import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from app_context_mcp.retrieval import SembleRetrieval
-from app_context_mcp.cache import repo_cache, search_cache
+from .cache import repo_cache, search_cache
 
 
 def ask_app_context(
@@ -49,15 +50,27 @@ def ask_app_context(
     role = user_role or "NON_TECH"
     query_text = " ".join(part for part in [question, screenshot_text, desired_behavior] if part).lower()
 
-    # ── L2 cache: search query cache (very short TTL) ──
-    search_key = f"srch:{repo}:{query_text[:80]}"
+    # ── L2 cache: search query cache keyed by git state ──
+    info = git_info(repo)
+    git_sha = info.get("git_commit") or ""
+    git_branch = info.get("git_branch") or ""
+    search_key = f"srch:{repo}:{hashlib.md5((query_text[:160] + git_sha + git_branch).encode()).hexdigest()}"
     cached_result = search_cache().get(search_key)
     if cached_result is not None:
         result = dict(cached_result)
-        result["cached"] = True
+        result["_cached"] = True
         return result
 
     intents = detect_intents(query_text)
+
+    # RAG semantic search — augment keyword search with vector similarity
+    rag_hits: list[dict] = []
+    try:
+        rag = RAGIndex(db_path=repo / ".app-context-rag.db")
+        rag_hits = rag.search(query_text, top_k=max_results)
+    except Exception:
+        pass
+
     screen_candidates = rank_screens(index, query_text, max_results=max_results)
     condition_hits = rank_conditions(index, query_text, max_results=max_results)
     api_hits = rank_apis(index, query_text, max_results=max_results)
@@ -105,16 +118,17 @@ def ask_app_context(
         "evidence_registry": evidence_registry,
         "unknowns_and_limits": unknowns,
         "index_info": build_index_info(index),
-        "search_info": {**semble_evidence, "query": query_text[:200]},
+        "search_info": {**semble_evidence, "query": query_text[:200], "rag_hits": rag_hits[:5]},
         "code_graph": build_code_graph(index).export(),
         "graph_evidence_pack": build_graph_evidence_pack(index, screen_candidates, condition_hits, api_hits, field_hits),
         "import_graph": build_import_graph(index),
         "execution_flows": build_execution_flows(index, screen_candidates),
         "impact_analysis": build_impact_analysis(index, screen_candidates, condition_hits, api_hits),
-        "_cached": False,
     }
 
-    # Cache search result for 30s
+    result["_cached"] = False
+
+    # Cache search result for 30s — invalidated on git commit/branch change
     search_cache().set(search_key, dict(result), ttl=30.0)
     return result
 
