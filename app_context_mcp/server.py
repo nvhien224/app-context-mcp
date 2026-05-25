@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -192,6 +193,37 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> Any:
     return mcp
 
 
+def _wrap_streamable_http_app(mcp_app: Any) -> Any:
+    """Wrap streamable_http_app to redirect / → /mcp for Claude Desktop compatibility.
+
+    Claude Desktop dùng SSE mode (/sse endpoint). Nếu dùng streamable-http
+    mode (/mcp endpoint), Claude Desktop sẽ POST / → 404 vì nó không tự
+    discovery /mcp.
+
+    Fix: wrapper redirect / và /register → /mcp, mount MCP app at /mcp và /.
+    """
+    from starlette.applications import Starlette
+    from starlette.requests import Request
+    from starlette.responses import RedirectResponse
+    from starlette.routing import Route
+
+    async def root_redirect(request: Request) -> RedirectResponse:
+        return RedirectResponse(url="/mcp", status_code=307)
+
+    wrapper = Starlette(
+        routes=[
+            Route("/", endpoint=root_redirect, methods=["GET", "POST"]),
+            Route("/register", endpoint=root_redirect, methods=["GET", "POST"]),
+        ]
+    )
+    # Mount the actual MCP app at /mcp — FastMCP streamable_http_app already handles /mcp
+    # But some versions mount at root; guard with a fallback mount
+    wrapper.mount("/mcp", mcp_app)
+    # Also mount at root as catch-all for anything not caught above
+    wrapper.mount("/", mcp_app)
+    return wrapper
+
+
 def run_https_server(
     server: Any,
     transport: str,
@@ -223,7 +255,7 @@ def run_https_server(
     if transport == "sse":
         app = server.sse_app()
     elif transport == "streamable-http":
-        app = server.streamable_http_app()
+        app = _wrap_streamable_http_app(server.streamable_http_app())
     else:
         raise SystemExit(f"Unsupported HTTPS transport: {transport}")
 
@@ -240,11 +272,23 @@ def run_https_server(
         temp_dir.cleanup()
 
 
-def generate_dev_certificate(certfile: str, keyfile: str) -> None:
-    import subprocess
+def _wrap_http_run(server: Any, transport: str, host: str, port: int) -> None:
+    """Wrap server.run() for streamable-http redirect support (non-HTTPS path)."""
+    if transport == "streamable-http":
+        try:
+            # FastMCP.run() with streamable-http may use uvicorn directly
+            import uvicorn
+            app = _wrap_streamable_http_app(server.streamable_http_app())
+            uvicorn.run(app, host=host, port=port, log_level="info")
+            return
+        except Exception:
+            pass  # fallback to server.run()
+    server.run(transport=transport, host=host, port=port)
 
+
+def generate_dev_certificate(certfile: str, keyfile: str) -> None:
     cmd = [
-        "openssl", "req", "-x509", "-newkey", "rsa:2048",        "-nodes",
+        "openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes",
         "-keyout", keyfile,
         "-out", certfile,
         "-days", "7",
@@ -296,7 +340,7 @@ def main() -> None:
             generate_self_signed=args.generate_self_signed,
         )
     else:
-        server.run(transport=args.transport)
+        _wrap_http_run(server, args.transport, args.host, args.port)
 
 
 if __name__ == "__main__":
