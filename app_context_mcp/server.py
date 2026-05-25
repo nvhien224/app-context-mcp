@@ -193,24 +193,6 @@ def create_server(host: str = "127.0.0.1", port: int = 8000) -> Any:
     return mcp
 
 
-def _wrap_streamable_http_app(mcp_app: Any) -> Any:
-    """Deprecated: kept for compatibility but not used at runtime.
-
-    FastMCP streamable_http_app() requires lifespan init từ .run().
-    Khi mount qua uvicorn trước khi .run() gọi = Task group not initialized.
-    Claude Desktop chỉ hỗ trợ SSE (/sse) — không hỗ trợ streamable-http.
-    """
-    return mcp_app  # passthrough — không mount wrapper gây lỗi
-
-
-def _log_transport_switch(requested: str, actual: str) -> None:
-    import logging
-    logging.getLogger("app-context-mcp").warning(
-        f"Transport '{requested}' không khả thi với uvicorn lifespan — auto-switch sang '{actual}'. "
-        f"Claude Desktop chỉ hỗ trợ SSE (/sse). URL: https://host:port/sse"
-    )
-
-
 def run_https_server(
     server: Any,
     transport: str,
@@ -220,15 +202,9 @@ def run_https_server(
     ssl_keyfile: str | None,
     generate_self_signed: bool,
 ) -> None:
-    """FastMCP SSE/HTTP with uvicorn TLS."""
+    """FastMCP SSE/HTTP with uvicorn TLS — both transports via uvicorn directly."""
     if transport == "stdio":
         raise SystemExit("HTTPS is only valid for sse or streamable-http transports, not stdio.")
-
-    # Issue #8: streamable_http_app() chưa init task group khi mount → crash.
-    # Claude Desktop chỉ dùng SSE (/sse) — auto-switch.
-    if transport == "streamable-http":
-        _log_transport_switch("streamable-http", "sse")
-        transport = "sse"
 
     certfile = ssl_certfile
     keyfile = ssl_keyfile
@@ -245,8 +221,12 @@ def run_https_server(
 
     import uvicorn
 
-    # Chỉ dùng sse_app() — streamable_http_app() không hoạt động với uvicorn TLS
-    app = server.sse_app()
+    # Issue #8 fix: dùng uvicorn.run trực tiếp với app — lifespan được gọi đúng,
+    # mount wrapper Starlette gây crash vì không propagate lifespan.
+    if transport == "streamable-http":
+        app = server.streamable_http_app()
+    else:
+        app = server.sse_app()
 
     uvicorn.run(
         app,
@@ -262,10 +242,7 @@ def run_https_server(
 
 
 def _wrap_http_run(server: Any, transport: str, host: str, port: int) -> None:
-    """Auto-switch streamable-http → SSE (issue #8: task group not initialized)."""
-    if transport == "streamable-http":
-        _log_transport_switch("streamable-http", "sse")
-        transport = "sse"
+    """Pass-through: FastMCP.run() handles lifespan init for both sse và streamable-http."""
     server.run(transport=transport, host=host, port=port)
 
 
