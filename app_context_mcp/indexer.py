@@ -24,13 +24,22 @@ METHOD_RE = re.compile(r"(?:Future<[^>]+>|Future<void>|[\w<>?,\s]+)\s+(\w+)\s*\(
 VISIBILITY_RE = re.compile(r"(?:enabled|visible)\s*:\s*([^,\)\}]+)")
 # Flutter framework patterns (Dio, hooks, Riverpod, AutoRoute, localization)
 DIO_RE = re.compile(r"dio\.(get|post|put|delete|patch)\("+r"\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
-HOOK_RE = re.compile(r"(useQuery|useMutation|useFuture|useMemoized)\s*\(")
+# Any custom hook following use[A-Z] convention (useQuery, useGetDetailActivity, etc.)
+HOOK_RE = re.compile(r"\b(use[A-Z]\w+)\s*\(")
 RIVERPOD_RE = re.compile(r"ref\.(read|watch|listen)\s*\(")
 AUTOROUTE_RE = re.compile(r"(@RoutePage)\s*\(")
 TR_RE = re.compile(r'([\'\"].*?[\'\"])\.tr\b', re.IGNORECASE)
 FREEZED_RE = re.compile(r"(@freezed)\b")
 JSON_SERIAL_RE = re.compile(r"(@JsonSerializable)\b")
 IDENT_RE = re.compile(r"\b\w+\b")
+# Service classes wrapping HTTP calls
+SERVICE_RE = re.compile(r"class\s+(\w+Service)\b")
+SERVICE_METHOD_RE = re.compile(r"\b(\w+Service)\.(\w+)\s*\([^)]*\)")
+# Conditional widget returns: if (cond) return Widget(...) or if (cond) { return ... }
+COND_RETURN_RE = re.compile(r"if\s*\((.*?)\)\s*(?:\{[^}]*?return\s+([\w]+)|return\s+([\w]+))", re.DOTALL)
+# Widget composition: child: SomeWidget(...) or return SomeWidget(...)
+CHILD_WIDGET_RE = re.compile(r"(?:child|body)\s*:\s*(\w+)\s*\(")
+RETURN_WIDGET_RE = re.compile(r"return\s+(\w+)\s*\(")
 
 def _hash_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()[:32]
@@ -56,9 +65,16 @@ def init_db(db_path: str) -> sqlite3.Connection:
     return conn
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
+    # Schema migration: drop old mtime-based table if exists (v1 → v2, issue #7)
+    has_mtime = conn.execute(
+        "SELECT 1 FROM pragma_table_info('file_cache') WHERE name='mtime'"
+    ).fetchone()
+    if has_mtime:
+        conn.execute("DROP TABLE file_cache")
+        conn.commit()
     conn.executescript("""
-    CREATE TABLE IF NOT EXISTS file_cache (rel_path TEXT PRIMARY KEY, mtime REAL, size INTEGER, parsed_json TEXT);
-    CREATE INDEX IF NOT EXISTS idx_fc_mtime ON file_cache(mtime);
+    CREATE TABLE IF NOT EXISTS file_cache (rel_path TEXT PRIMARY KEY, content_hash TEXT, size INTEGER, parsed_json TEXT);
+    CREATE INDEX IF NOT EXISTS idx_fc_hash ON file_cache(content_hash);
     CREATE TABLE IF NOT EXISTS repo_meta (repo_path TEXT PRIMARY KEY, last_scan_ts TEXT, dart_files INTEGER DEFAULT 0);
     """)
 
@@ -81,17 +97,72 @@ def _parse_single_file(file: Path, repo: Path) -> dict[str, Any]:
         parsed["evidence"].append({"id": eid, "source_type": source_type, "symbol": symbol, "line": line, "snippet": snippet_text, "why": why})
         return eid
 
-    # Screens
-    for name in classes:
-        if name.endswith(("Screen", "Page", "View")):
+    # Init widget context tracking
+    screen_name_for_widgets: str | None = None
+
+    # Screens / Widgets / Services — detect by base class or suffix
+    # Issue #1: suffix too narrow; Issue #2: missing base class detection
+    CLASS_EXTENDS_RE = re.compile(r"class\s+(\w+)\s+extends\s+([\w<>,\s]+)\b")
+    for m in CLASS_EXTENDS_RE.finditer(text):
+        name = m.group(1)
+        base = m.group(2).strip()
+        ln = _line_no(text, m.start())
+
+        # Service detection (issue #11)
+        if name.endswith("Service"):
+            add_ev("code", name, ln, _snippet(text, m.start(), 3), f"Service class: {name}")
+            # Scan service methods for HTTP calls
+            body_match = re.search(rf"class\s+{re.escape(name)}.*?(?=class\s|\Z)", text[m.start():], re.DOTALL)
+            if body_match:
+                body = body_match.group(0)
+                for cm in CLIENT_RE.finditer(body):
+                    cmethod = cm.group(1).upper()
+                    cpath = normalize_path_template(cm.group(2))
+                    cln = ln + body[:cm.start()].count("\n")
+                    parsed["api_calls"].append({
+                        "method": cmethod, "path": cpath,
+                        "client_method": name, "line": cln,
+                        "evidence_id": add_ev("code", name, cln, _snippet(body, cm.start()), f"API in {name}")
+                    })
+                for dm in DIO_RE.finditer(body):
+                    cmethod = dm.group(1).upper()
+                    cpath = normalize_path_template(dm.group(2))
+                    cln = ln + body[:dm.start()].count("\n")
+                    parsed["api_calls"].append({
+                        "method": cmethod, "path": cpath,
+                        "client_method": name, "line": cln,
+                        "evidence_id": add_ev("code", name, cln, _snippet(body, dm.start()), f"Dio API in {name}")
+                    })
+            continue
+
+        # Screen detection: extends Screen/Page/View base classes OR suffix
+        # Also detect Tab/Sheet/Dialog/Card/Box/Component (issue #1)
+        is_widget_base = any(b in base for b in ("HookWidget", "StatelessWidget", "StatefulWidget", "ConsumerWidget"))
+        is_screen_by_name = name.endswith(("Screen", "Page", "View", "Tab", "Sheet", "Dialog", "Card", "Box"))
+        is_widget = is_widget_base and not is_screen_by_name
+
+        if is_screen_by_name or is_widget:
             route = None
             rm = ROUTE_RE.search(text)
             if rm:
                 route = rm.group(1)
             vtexts = TEXT_RE.findall(text)
-            ev_id = add_ev("code", name, 1, _snippet(text, 0, 5), "Declares Flutter screen/page/view")
-            parsed["screens"].append({"name": name, "route": route, "visible_texts": vtexts, "evidence_id": ev_id})
-            break
+            ev_id = add_ev("code", name, ln, _snippet(text, m.start(), 5), f"Declares Flutter {'screen' if is_screen_by_name else 'widget'}: {name} extends {base}")
+            parsed["screens"].append({
+                "name": name, "route": route, "visible_texts": vtexts,
+                "evidence_id": ev_id, "base_class": base,
+                "is_screen": is_screen_by_name,
+                "is_widget": is_widget,
+            })
+            screen_name_for_widgets = name
+
+        if is_widget:
+            widg = f"widget:{rel}:{ln}"
+            parsed.setdefault("widgets", []).append({
+                "widget_type": name, "text": None, "line": ln,
+                "enclosing_screen": screen_name_for_widgets,
+                "condition_expression": None,
+            })
 
     # Method positions for nearest lookup
     method_spans: list[tuple[int, str]] = []
@@ -185,12 +256,47 @@ def _parse_single_file(file: Path, repo: Path) -> dict[str, Any]:
         parsed["conditions"].append({"expression": expr, "target": target, "line": ln, "fields": fields,
                                      "evidence_id": add_ev("code", target, ln, _snippet(text, m.start(), 2), "UI condition/handler expression")})
 
-    # ── Widgets & Hooks ──
+    # ── Widgets, Hooks, Composition, Conditionals ──
     parsed.setdefault("widgets", [])
     parsed.setdefault("hooks", [])
-    screen_name_for_widgets = parsed["screens"][0]["name"] if parsed["screens"] else None
+    parsed.setdefault("child_widgets", [])
+    parsed.setdefault("conditional_returns", [])
 
-    # Visibility widgets
+    # Widget composition: child: SomeWidget(...) / return SomeWidget(...) (issue #5)
+    for m in CHILD_WIDGET_RE.finditer(text):
+        child_type = m.group(1)
+        if child_type in {"Container", "Column", "Row", "SizedBox", "Expanded", "Padding", "Center", "Scaffold", "SingleChildScrollView", "SafeArea", "GestureDetector", "InkWell"}:
+            continue  # skip layout/structural widgets
+        ln = _line_no(text, m.start())
+        parsed["child_widgets"].append({
+            "widget_type": child_type,
+            "line": ln,
+            "enclosing_screen": screen_name_for_widgets,
+        })
+    for m in RETURN_WIDGET_RE.finditer(text):
+        wtype = m.group(1)
+        if wtype in {"Container", "Column", "Row", "SizedBox", "Expanded", "Padding", "Center", "Scaffold", "SingleChildScrollView", "SafeArea"}:
+            continue
+        ln = _line_no(text, m.start())
+        parsed["child_widgets"].append({
+            "widget_type": wtype,
+            "line": ln,
+            "enclosing_screen": screen_name_for_widgets,
+        })
+
+    # Conditional returns: if (cond) return Widget(...) (issue #6)
+    for m in COND_RETURN_RE.finditer(text):
+        cond = m.group(1).strip()
+        returned = m.group(2) or m.group(3)
+        ln = _line_no(text, m.start())
+        parsed["conditional_returns"].append({
+            "condition": cond,
+            "returned_widget": returned,
+            "line": ln,
+            "enclosing_screen": screen_name_for_widgets,
+        })
+
+    # Visibility widgets (existing)
     for m in re.finditer(r'visible:\s*([^,\n]+)', text):
         expr = m.group(1).strip()
         ln = _line_no(text, m.start())
@@ -249,17 +355,16 @@ def build_index(
     cached, reparsed = 0, 0
     for file in dart_files:
         rel = str(file.relative_to(repo))
-        stat = file.stat()
-        mtime, size = stat.st_mtime, stat.st_size
-        row = db.execute("SELECT parsed_json FROM file_cache WHERE rel_path=? AND mtime=? AND size=?",
-                         (rel, mtime, size)).fetchone()
+        content_hash = _hash_file(file)
+        row = db.execute("SELECT parsed_json FROM file_cache WHERE rel_path=? AND content_hash=?",
+                         (rel, content_hash)).fetchone()
         if row:
             parsed = json.loads(row["parsed_json"])
             cached += 1
         else:
             parsed = _parse_single_file(file, repo)
-            db.execute("INSERT OR REPLACE INTO file_cache(rel_path, mtime, size, parsed_json) VALUES (?,?,?,?)",
-                       (rel, mtime, size, json.dumps(parsed, ensure_ascii=False)))
+            db.execute("INSERT OR REPLACE INTO file_cache(rel_path, content_hash, size, parsed_json) VALUES (?,?,?,?)",
+                       (rel, content_hash, file.stat().st_size, json.dumps(parsed, ensure_ascii=False)))
             reparsed += 1
 
         for s in parsed.get("screens", []):
@@ -309,6 +414,29 @@ def build_index(
                 enclosing_screen=h.get("enclosing_screen"),
             ))
 
+        # Widget composition / child widgets (issue #5)
+        for cw in parsed.get("child_widgets", []):
+            cw_id = f"widget:{rel}:{cw['line']}"
+            index.widgets[cw_id] = WidgetInfo(
+                widget_type=cw["widget_type"],
+                text=None,
+                file=rel,
+                line=cw["line"],
+                enclosing_screen=cw.get("enclosing_screen"),
+                condition_expression=None,
+            )
+
+        # Conditional returns (issue #6)
+        for cr in parsed.get("conditional_returns", []):
+            index.conditions.append(ConditionInfo(
+                expression=f"if ({cr['condition']}): return {cr.get('returned_widget', '?')}",
+                target=cr.get("returned_widget", "UI conditional"),
+                file=rel,
+                line=cr["line"],
+                fields=[],
+                evidence_id="",
+            ))
+
     db.execute("INSERT OR REPLACE INTO repo_meta(repo_path, last_scan_ts, dart_files) VALUES (?,?,?)",
                (str(repo), datetime.now(timezone.utc).isoformat(), len(dart_files)))
     db.commit()
@@ -318,7 +446,8 @@ def build_index(
     return index
 
 def _should_ignore(p: Path) -> bool:
-    skip = {".git", ".dart_tool", "build", "ios", "android", "web", "macos", "windows", "linux"}
+    # Issue #12: add .worktrees, .claude, _workspace
+    skip = {".git", ".dart_tool", "build", "ios", "android", "web", "macos", "windows", "linux", ".worktrees", ".claude", "_workspace"}
     return bool(set(p.parts) & skip) or p.name.endswith(".g.dart") or p.name.endswith(".freezed.dart")
 
 def git_info(repo_path: str | Path) -> dict:

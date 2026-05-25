@@ -125,6 +125,17 @@ def ask_app_context(
         "impact_analysis": build_impact_analysis(index, screen_candidates, condition_hits, api_hits),
     }
 
+    # ── Fallback: raw grep if everything returns empty (issue #10) ──
+    if status == "not_found":
+        fallback = _fallback_raw_grep(repo, query_text, max_results=max_results)
+        if fallback:
+            status = "partial"
+            result["fallback_candidates"] = fallback
+        else:
+            result["fallback_candidates"] = []
+    else:
+        result["fallback_candidates"] = []
+
     result["_cached"] = False
 
     # Cache search result for 30s — invalidated on git commit/branch change
@@ -164,6 +175,62 @@ def extract_keywords(text: str) -> list[str]:
     stop = {"màn", "này", "vì", "sao", "không", "api", "field", "logic", "the", "and", "what", "how"}
     tokens = [tok.strip(" ?.,:;!()[]{}\"'").lower() for tok in text.replace("/", " ").split()]
     return sorted({tok for tok in tokens if len(tok) >= 3 and tok not in stop})[:30]
+
+
+def _fallback_raw_grep(repo: Path, query: str, max_results: int = 20) -> list[dict[str, Any]]:
+    """Issue #10: fallback grep across all Dart files when semantic search returns zero."""
+    import subprocess
+    keywords = extract_keywords(query)[:5]
+    results: list[dict[str, Any]] = []
+    seen = set()
+    for kw in keywords:
+        try:
+            proc = subprocess.run(
+                ["rg", "-i", "-l", "-t", "dart", "--max-count", "50", kw, str(repo)],
+                capture_output=True, text=True, timeout=10
+            )
+            for line in proc.stdout.strip().splitlines()[:max_results // len(keywords) + 1]:
+                fpath = Path(line)
+                if not fpath.exists():
+                    continue
+                rel = str(fpath.relative_to(repo))
+                if rel in seen:
+                    continue
+                seen.add(rel)
+                # Get snippet
+                snippet_proc = subprocess.run(
+                    ["rg", "-i", "--context", "2", kw, str(fpath)],
+                    capture_output=True, text=True, timeout=5
+                )
+                results.append({
+                    "file": rel,
+                    "match_keyword": kw,
+                    "snippet": snippet_proc.stdout[:500],
+                })
+        except (FileNotFoundError, subprocess.TimeoutExpired):
+            # ripgrep not installed or timed out; try python fallback
+            for p in repo.rglob("*.dart"):
+                text = p.read_text(encoding="utf-8", errors="ignore")
+                if kw in text.lower():
+                    rel = str(p.relative_to(repo))
+                    if rel in seen:
+                        continue
+                    seen.add(rel)
+                    lines = text.splitlines()
+                    for i, line in enumerate(lines):
+                        if kw in line.lower():
+                            snippet = "\n".join(lines[max(0, i-2):min(len(lines), i+3)])
+                            results.append({
+                                "file": rel,
+                                "match_keyword": kw,
+                                "snippet": snippet[:500],
+                            })
+                            break
+                    if len(results) >= max_results:
+                        break
+        if len(results) >= max_results:
+            break
+    return results[:max_results]
 
 
 def rank_screens(index: AppIndex, query: str, max_results: int) -> list[dict[str, Any]]:

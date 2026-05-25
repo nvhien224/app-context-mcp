@@ -262,6 +262,133 @@ def _guess_class_name(var_name: str) -> list[str]:
 
 # ── Execution Flow builder ────────────────────────────────────────────────
 
+def _bfs_imports(start_files: set[str], index: AppIndex, max_depth: int = 3) -> set[str]:
+    """BFS across import_graph to find transitively imported files."""
+    visited: set[str] = set(start_files)
+    frontier = list(start_files)
+    depth = 0
+    while frontier and depth < max_depth:
+        next_frontier = []
+        for f in frontier:
+            for imp in index.import_graph.get(f, set()):
+                if imp not in visited:
+                    visited.add(imp)
+                    next_frontier.append(imp)
+        frontier = next_frontier
+        depth += 1
+    return visited
+
+
+def _find_api_in_files(method_name: str, files: set[str], index: AppIndex) -> list[dict[str, Any]]:
+    """Find API calls matching method_name across given files."""
+    steps: list[dict] = []
+    for api in index.api_calls:
+        if api.file in files and api.client_method == method_name:
+            steps.append({
+                "node": f"{api.method} {api.path_template}",
+                "kind": "api_call",
+                "file": api.file,
+                "line": api.line,
+                "api_path": api.path_template,
+                "evidence_id": api.evidence_id,
+            })
+    return steps
+
+
+def _find_repo_calls_in_files(files: set[str], index: AppIndex) -> list[dict[str, Any]]:
+    """Find repo.method() calls in given files — only read files that haven't been parsed yet."""
+    steps: list[dict] = []
+    for rel in files:
+        fpath = index.repo_path / rel
+        if not fpath.exists():
+            continue
+        text = fpath.read_text(encoding="utf-8", errors="ignore")
+        for m in _METHOD_INVOCATION_RE.finditer(text):
+            obj, method = m.groups()
+            if any(obj.endswith(s) for s in ("Repo", "Repository", "repo", "_repo", "Service")):
+                ln = text[: m.start()].count("\n") + 1
+                steps.append({
+                    "node": f"{obj}.{method}()",
+                    "kind": "repo_call",
+                    "file": rel,
+                    "line": ln,
+                })
+    return steps
+
+
+def _trace_handler_deep(handler: str, screen_file: str, index: AppIndex, max_depth: int = 3) -> list[dict[str, Any]]:
+    """BFS trace: cubit.method() → imported files → API calls. (issue #4)"""
+    if '.' not in handler:
+        return []
+    var_name, method_name = handler.split('.', 1)
+    method_name = method_name.split('(')[0]
+
+    # Find cubit file
+    bloc_file = _find_file_for_bloc_var(var_name, screen_file, index)
+    if not bloc_file:
+        return []
+
+    steps: list[dict] = []
+    # Step 1: repo calls in cubit file
+    cubit_files = {bloc_file}
+    repo_steps = _find_repo_calls_in_files(cubit_files, index)
+    steps.extend(repo_steps)
+
+    # Step 2: BFS imports for API
+    all_files = _bfs_imports(cubit_files, index, max_depth=max_depth)
+    api_steps = _find_api_in_files(method_name, all_files, index)
+    if not api_steps:
+        # Try repo methods as client_method too
+        for rs in repo_steps:
+            repo_method = rs["node"].split('.')[-1].rstrip('()')
+            api_steps = _find_api_in_files(repo_method, all_files, index)
+            if api_steps:
+                break
+    steps.extend(api_steps)
+    return steps
+
+
+def _trace_bloc_add_deep(bloc_var: str, event_name: str, screen_file: str, index: AppIndex, max_depth: int = 3) -> list[dict[str, Any]]:
+    """BFS trace: .add(Event) → imported bloc file → repo calls → API. (issue #4)"""
+    bloc_file = _find_file_for_bloc_var(bloc_var, screen_file, index)
+    if not bloc_file:
+        return []
+
+    steps: list[dict] = []
+    # Read bloc file and trace event handler
+    bloc_path = index.repo_path / bloc_file
+    if not bloc_path.exists():
+        return []
+    bloc_text = bloc_path.read_text(encoding="utf-8", errors="ignore")
+
+    # Find event handler method: on<EventName> or handle<EventName>
+    handler_names = [f"on{event_name}", f"_on{event_name}", f"handle{event_name}", event_name[0].lower() + event_name[1:]]
+    handler_method = None
+    for hn in handler_names:
+        if hn in bloc_text:
+            handler_method = hn
+            break
+
+    all_files = _bfs_imports({bloc_file}, index, max_depth=max_depth)
+
+    # Repo calls in bloc/transitive files
+    repo_steps = _find_repo_calls_in_files(all_files, index)
+    steps.extend(repo_steps)
+
+    # API calls linked to handler or repo methods
+    apis = _find_api_in_files(event_name, all_files, index)
+    if not apis and handler_method:
+        apis = _find_api_in_files(handler_method, all_files, index)
+    if not apis:
+        for rs in repo_steps:
+            repo_m = rs["node"].split('.')[-1].rstrip('()')
+            apis = _find_api_in_files(repo_m, all_files, index)
+            if apis:
+                break
+    steps.extend(apis)
+    return steps
+
+
 def build_execution_flows(index: AppIndex) -> None:
     """Trace end-to-end flows: Screen → BLoC/Controller → Repository → API."""
     flows: list[ExecutionFlow] = []
@@ -345,41 +472,15 @@ def build_execution_flows(index: AppIndex) -> None:
                         "file": h.file,
                         "line": h.line,
                     })
-                    # Trace hook → cubit/bloc → repo → api
+                    # Trace hook → cubit/bloc → repo → api via import BFS (issue #4)
                     handler = h.handler_method
-                    # Check if handler is cubit.method() pattern
-                    if '.' in handler:
-                        var_name, method_name = handler.split('.', 1)
-                        method_name = method_name.split('(')[0]  # strip args
-                        # Find file for bloc/cubit
-                        bloc_file_rel = _find_file_for_bloc_var(var_name, screen_file, index)
-                        if bloc_file_rel:
-                            # Trace API calls where client_method matches handler method name
-                            for api in index.api_calls:
-                                if api.file == bloc_file_rel and api.client_method == method_name:
-                                    steps.append({
-                                        "node": f"{api.method} {api.path_template}",
-                                        "kind": "api_call",
-                                        "file": api.file,
-                                        "line": api.line,
-                                    })
-                                    apis.append(api.path_template)
-                                    ev_ids.append(api.evidence_id)
-                            # If no direct API in bloc file, trace through imported files (e.g. order_api.dart)
-                            if bloc_file_rel in index.import_graph:
-                                for imported_api_file in index.import_graph[bloc_file_rel]:
-                                    for api in index.api_calls:
-                                        if api.file == imported_api_file and api.client_method == method_name:
-                                            steps.append({
-                                                "node": f"{api.method} {api.path_template}",
-                                                "kind": "api_call",
-                                                "file": api.file,
-                                                "line": api.line,
-                                            })
-                                            apis.append(api.path_template)
-                                            ev_ids.append(api.evidence_id)
+                    hook_steps = _trace_handler_deep(handler, screen_file, index, max_depth=3)
+                    if hook_steps:
+                        steps.extend(hook_steps)
+                        apis.extend([p for p in (s.get("api_path") for s in hook_steps if s["kind"] == "api_call") if p])
+                        ev_ids.extend([e for e in (s.get("evidence_id") for s in hook_steps if s.get("evidence_id")) if e])
 
-            # Bloc step (legacy .add pattern)
+            # Bloc step (legacy .add pattern) with deep tracing
             for bv, ev, ln in bloc_adds:
                 steps.append({
                     "node": f"{bv}.add({ev})",
@@ -387,31 +488,11 @@ def build_execution_flows(index: AppIndex) -> None:
                     "file": screen_file,
                     "line": ln,
                 })
-                # Trace bloc → repo → api via imported bloc file
-                bloc_file_rel = _find_file_for_bloc_var(bv, screen_file, index)
-                if bloc_file_rel:
-                    bloc_text = (index.repo_path / bloc_file_rel).read_text(encoding="utf-8", errors="ignore")
-                    for rm in _METHOD_INVOCATION_RE.finditer(bloc_text):
-                        obj, method = rm.groups()
-                        if any(obj.endswith(s) for s in ("Repo", "Repository", "repo", "_repo")):
-                            rln = bloc_text[: rm.start()].count("\n") + 1
-                            steps.append({
-                                "node": f"{obj}.{method}()",
-                                "kind": "repo_call",
-                                "file": bloc_file_rel,
-                                "line": rln,
-                            })
-                            # Link to API
-                            for api in index.api_calls:
-                                if api.file == bloc_file_rel and api.client_method == method:
-                                    steps.append({
-                                        "node": f"{api.method} {api.path_template}",
-                                        "kind": "api_call",
-                                        "file": api.file,
-                                        "line": api.line,
-                                    })
-                                    apis.append(api.path_template)
-                                    ev_ids.append(api.evidence_id)
+                bloc_steps = _trace_bloc_add_deep(bv, ev, screen_file, index, max_depth=3)
+                if bloc_steps:
+                    steps.extend(bloc_steps)
+                    apis.extend([p for p in (s.get("api_path") for s in bloc_steps if s["kind"] == "api_call") if p])
+                    ev_ids.extend([e for e in (s.get("evidence_id") for s in bloc_steps if s.get("evidence_id")) if e])
 
             # Direct repo calls in screen → API linkage
             for rv, rm, rln in repo_calls:
