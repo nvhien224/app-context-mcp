@@ -310,7 +310,8 @@ def build_execution_flows(index: AppIndex) -> None:
                         bloc_adds.append((bv, ev, line))
 
         # Build flow steps
-        if bloc_adds or repo_calls:
+        has_flow = bool(bloc_adds or repo_calls or index.hooks)
+        if has_flow:
             steps: list[dict] = []
             screens_involved = [screen_name]
             apis = []
@@ -324,7 +325,61 @@ def build_execution_flows(index: AppIndex) -> None:
                 "line": 1,
             })
 
-            # Bloc step
+            # Widget steps
+            for wid, w in index.widgets.items():
+                if w.enclosing_screen == screen_name:
+                    steps.append({
+                        "node": w.widget_type + (f" ({w.text})" if w.text else ""),
+                        "kind": "ui_widget",
+                        "file": w.file,
+                        "line": w.line,
+                        "condition": w.condition_expression,
+                    })
+
+            # Hook steps from indexed hooks
+            for h in index.hooks:
+                if h.enclosing_screen == screen_name:
+                    steps.append({
+                        "node": f"{h.hook_type}: {h.handler_method}",
+                        "kind": "ui_hook",
+                        "file": h.file,
+                        "line": h.line,
+                    })
+                    # Trace hook → cubit/bloc → repo → api
+                    handler = h.handler_method
+                    # Check if handler is cubit.method() pattern
+                    if '.' in handler:
+                        var_name, method_name = handler.split('.', 1)
+                        method_name = method_name.split('(')[0]  # strip args
+                        # Find file for bloc/cubit
+                        bloc_file_rel = _find_file_for_bloc_var(var_name, screen_file, index)
+                        if bloc_file_rel:
+                            # Trace API calls where client_method matches handler method name
+                            for api in index.api_calls:
+                                if api.file == bloc_file_rel and api.client_method == method_name:
+                                    steps.append({
+                                        "node": f"{api.method} {api.path_template}",
+                                        "kind": "api_call",
+                                        "file": api.file,
+                                        "line": api.line,
+                                    })
+                                    apis.append(api.path_template)
+                                    ev_ids.append(api.evidence_id)
+                            # If no direct API in bloc file, trace through imported files (e.g. order_api.dart)
+                            if bloc_file_rel in index.import_graph:
+                                for imported_api_file in index.import_graph[bloc_file_rel]:
+                                    for api in index.api_calls:
+                                        if api.file == imported_api_file and api.client_method == method_name:
+                                            steps.append({
+                                                "node": f"{api.method} {api.path_template}",
+                                                "kind": "api_call",
+                                                "file": api.file,
+                                                "line": api.line,
+                                            })
+                                            apis.append(api.path_template)
+                                            ev_ids.append(api.evidence_id)
+
+            # Bloc step (legacy .add pattern)
             for bv, ev, ln in bloc_adds:
                 steps.append({
                     "node": f"{bv}.add({ev})",
@@ -332,7 +387,7 @@ def build_execution_flows(index: AppIndex) -> None:
                     "file": screen_file,
                     "line": ln,
                 })
-                # Try to trace to repository in bloc file
+                # Trace bloc → repo → api via imported bloc file
                 bloc_file_rel = _find_file_for_bloc_var(bv, screen_file, index)
                 if bloc_file_rel:
                     bloc_text = (index.repo_path / bloc_file_rel).read_text(encoding="utf-8", errors="ignore")
@@ -358,7 +413,7 @@ def build_execution_flows(index: AppIndex) -> None:
                                     apis.append(api.path_template)
                                     ev_ids.append(api.evidence_id)
 
-            # Direct repo calls in screen
+            # Direct repo calls in screen → API linkage
             for rv, rm, rln in repo_calls:
                 steps.append({
                     "node": f"{rv}.{rm}()",
@@ -366,7 +421,6 @@ def build_execution_flows(index: AppIndex) -> None:
                     "file": screen_file,
                     "line": rln,
                 })
-                # Link to API
                 for api in index.api_calls:
                     if api.file == screen_file and api.client_method == rm:
                         steps.append({
@@ -396,9 +450,22 @@ def build_execution_flows(index: AppIndex) -> None:
 
 
 def _find_file_for_bloc_var(var_name: str, screen_file: str, index: AppIndex) -> str | None:
-    """Guess which imported file contains the BLoC referenced by var_name."""
+    """Guess which imported file contains the BLoC/Cubit referenced by var_name."""
+    import_rels = index.import_graph.get(screen_file, set())
+
+    # Heuristic A: import file name contains bloc/cubit/viewmodel/controller
+    for imported_rel in import_rels:
+        lower = imported_rel.lower()
+        if any(k in lower for k in ("cubit", "bloc", "viewmodel", "controller", "view_model")):
+            path = index.repo_path / imported_rel
+            if path.exists():
+                text = path.read_text(encoding="utf-8", errors="ignore")
+                if re.search(r"class\s+\w+(?:Cubit|Bloc|ViewModel|Controller|View_Model)\b", text):
+                    return imported_rel
+
+    # Heuristic B: guess class name from var
     guesses = _guess_class_name(var_name)
-    for imported_rel in index.import_graph.get(screen_file, set()):
+    for imported_rel in import_rels:
         imported_path = index.repo_path / imported_rel
         if not imported_path.exists():
             continue
@@ -411,8 +478,11 @@ def _find_file_for_bloc_var(var_name: str, screen_file: str, index: AppIndex) ->
 
 # ── Public builder ─────────────────────────────────────────────────────────
 
-def build_graph(index: AppIndex, dart_files: list[Path]) -> None:
+from .indexer import _should_ignore
+
+def build_graph(index: AppIndex) -> None:
     """Build import graph, symbols, cross-file edges, and execution flows."""
+    dart_files = [p for p in index.repo_path.rglob("*.dart") if not _should_ignore(p)]
     # Pass 1: imports + symbols per file
     for file in dart_files:
         text = file.read_text(encoding="utf-8", errors="ignore")

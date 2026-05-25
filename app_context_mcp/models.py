@@ -94,6 +94,29 @@ class SymbolEdge:
 
 
 @dataclass
+class WidgetInfo:
+    """A UI widget in a screen (e.g. ElevatedButton, Visibility, Text)."""
+    widget_type: str
+    text: str | None
+    file: str
+    line: int
+    enclosing_screen: str | None = None
+    event_handler: str | None = None
+    condition_expression: str | None = None
+
+
+@dataclass
+class HookInfo:
+    """Event handler attached to a widget (onPressed, onTap, onChanged...)."""
+    hook_type: str
+    target_widget: str
+    handler_method: str
+    file: str
+    line: int
+    enclosing_screen: str | None = None
+
+
+@dataclass
 class ExecutionFlow:
     """End-to-end trace: UI → BLoC → Repo → API → Response."""
     name: str
@@ -124,7 +147,8 @@ class AppIndex:
     import_graph: dict[str, set[str]] = field(default_factory=dict)
     # reverse: file → set of files that import this file
     import_graph_reverse: dict[str, set[str]] = field(default_factory=dict)
-    # hooks / annotations / models (lightweight)
-    hooks: list[dict] = field(default_factory=list)
+    # widget/hook tracking
+    widgets: dict[str, WidgetInfo] = field(default_factory=dict)
+    hooks: list[HookInfo] = field(default_factory=list)
     annotations: list[dict] = field(default_factory=list)
     model_annotations: list[dict] = field(default_factory=list)

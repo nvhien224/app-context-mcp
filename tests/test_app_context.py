@@ -66,3 +66,62 @@ def test_not_found_does_not_hallucinate_specific_screen():
     assert result["status"] in {"not_found", "partial", "ambiguous"}
     assert result["unknowns_and_limits"]
     assert not any(candidate["screen_name"] == "LoyaltySpinWheelScreen" for candidate in result["screen_candidates"])
+
+
+def test_execution_flow_trace_chain():
+    """Verify full Screen → Widget → Hook → Service → API chain in execution flows."""
+    result = ask_app_context(
+        repo_path=FIXTURE,
+        question="Chi tiết đơn hàng",
+    )
+    assert result["status"] == "found"
+    assert result["screen_candidates"][0]["screen_name"] == "OrderDetailScreen"
+
+    # Execution flows must contain the chain
+    flows = result["execution_flows"]
+    assert flows, "Should have at least one execution flow"
+    flow = flows[0]
+    steps = flow["steps"]
+    kinds = [s["kind"] for s in steps]
+    assert "screen" in kinds
+    assert "ui_widget" in kinds, "Should have widget step"
+    assert "ui_hook" in kinds, "Should have hook step"
+    assert any(k in kinds for k in ("service_call", "repo_call", "api_call")), "Should trace to service/api"
+    assert any(api == "/orders/{id}/cancel" for api in flow["apis_involved"]), "Should include cancel API"
+
+
+def test_code_graph_trace_edges():
+    """Verify code graph edges follow Screen → Widget → Hook → API chain."""
+    from app_context_mcp.indexer import build_index
+    from app_context_mcp.graph_builder import build_graph
+    from app_context_mcp.code_graph import build_code_graph
+
+    index = build_index(FIXTURE)
+    build_graph(index)
+    cg = build_code_graph(index)
+
+    relations = {e[2] for e in cg.edges}
+    assert "contains" in relations, "Screen→Widget edge missing"
+    assert "triggers_hook" in relations, "Widget→Hook edge missing"
+    assert "calls_api" in relations, "Hook/API→API edge missing"
+
+    # Find trace path
+    screen = "screen:OrderDetailScreen"
+    widget = None
+    hook = None
+    api_target = None
+    for e in cg.edges:
+        if e[0] == screen and e[2] == "contains":
+            widget = e[1]
+        if e[0].startswith("screen:") and e[2] == "triggers":
+            hook = e[1]
+        if e[2] == "triggers_hook":
+            widget = e[0]
+            hook = e[1]
+        if e[2] == "calls_api" and e[0].startswith("hook:"):
+            hook = e[0]
+            api_target = e[1]
+
+    assert widget and widget.startswith("widget:"), "Widget node not found"
+    assert hook and hook.startswith("hook:"), "Hook node not found"
+    assert api_target and api_target.startswith("api:"), "API endpoint not linked from hook"

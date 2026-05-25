@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from app_context_mcp.models import (
-    AppIndex, ApiCall, ConditionInfo, Evidence, FieldInfo, ScreenInfo,
+    AppIndex, ApiCall, ConditionInfo, Evidence, FieldInfo, ScreenInfo, WidgetInfo, HookInfo,
 )
 
 CLASS_RE = re.compile(r"class\s+(\w+)")
@@ -185,6 +185,35 @@ def _parse_single_file(file: Path, repo: Path) -> dict[str, Any]:
         parsed["conditions"].append({"expression": expr, "target": target, "line": ln, "fields": fields,
                                      "evidence_id": add_ev("code", target, ln, _snippet(text, m.start(), 2), "UI condition/handler expression")})
 
+    # ── Widgets & Hooks ──
+    parsed.setdefault("widgets", [])
+    parsed.setdefault("hooks", [])
+    screen_name_for_widgets = parsed["screens"][0]["name"] if parsed["screens"] else None
+
+    # Visibility widgets
+    for m in re.finditer(r'visible:\s*([^,\n]+)', text):
+        expr = m.group(1).strip()
+        ln = _line_no(text, m.start())
+        parsed["widgets"].append({
+            "widget_type": "Visibility",
+            "text": None,
+            "line": ln,
+            "enclosing_screen": screen_name_for_widgets,
+            "condition_expression": expr,
+        })
+
+    # Event handlers (onPressed, onTap, onChanged, onSubmitted)
+    for m in re.finditer(r'on(Pressed|Tap|Changed|Submitted)\s*:\s*(?:\(\)\s*=>)?\s*([^,\n]+)', text):
+        hook_type = f"on{m.group(1)}"
+        handler = m.group(2).strip()
+        ln = _line_no(text, m.start())
+        parsed["hooks"].append({
+            "hook_type": hook_type,
+            "handler_method": handler,
+            "line": ln,
+            "enclosing_screen": screen_name_for_widgets,
+        })
+
     return parsed
 
 def _nearest(method_spans: list[tuple[int, str]], offset: int) -> str | None:
@@ -249,13 +278,36 @@ def build_index(
         for e in parsed.get("evidence", []):
             index.evidence[e["id"]] = Evidence(id=e["id"], source_type=e["source_type"], file=rel,
                                                   symbol=e["symbol"], lines=str(e["line"]), snippet=e["snippet"], why_relevant=e["why"])
-        # New patterns
-        for h in parsed.get("hooks", []):
-            index.hooks.append(h)
+        # Annotations/models
         for ann in parsed.get("annotations", []):
             index.annotations.append(ann)
         for ma in parsed.get("model_annotations", []):
             index.model_annotations.append(ma)
+
+        # Widgets
+        for w in parsed.get("widgets", []):
+            wid = f"widget:{rel}:{w['line']}"
+            index.widgets[wid] = WidgetInfo(
+                widget_type=w["widget_type"],
+                text=w.get("text"),
+                file=rel,
+                line=w["line"],
+                enclosing_screen=w.get("enclosing_screen"),
+                condition_expression=w.get("condition_expression"),
+            )
+
+        # Hooks (Widget event handlers only — skip legacy useQuery/useMutation hooks)
+        for h in parsed.get("hooks", []):
+            if "hook_type" not in h:
+                continue
+            index.hooks.append(HookInfo(
+                hook_type=h["hook_type"],
+                target_widget=h["handler_method"],
+                handler_method=h["handler_method"],
+                file=rel,
+                line=h["line"],
+                enclosing_screen=h.get("enclosing_screen"),
+            ))
 
     db.execute("INSERT OR REPLACE INTO repo_meta(repo_path, last_scan_ts, dart_files) VALUES (?,?,?)",
                (str(repo), datetime.now(timezone.utc).isoformat(), len(dart_files)))

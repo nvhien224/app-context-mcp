@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from .graph_builder import build_graph
 
 def ask_app_context(
     repo_path: str | Path,
@@ -40,6 +41,8 @@ def ask_app_context(
             except Exception:
                 semble_candidates = None
         index = build_index(repo, semble_candidate_files=semble_candidates)
+        # Build import graph + symbol graph + execution flows
+        build_graph(index)
         repo_cache().set(cache_key, index, ttl=60.0)
 
     role = user_role or "NON_TECH"

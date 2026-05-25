@@ -253,4 +253,52 @@ def build_code_graph(index: AppIndex) -> CodeGraph:
             for fn in shared:
                 g.add_edge(cond1, cond2, "co_conditions_via" if fn == list(shared)[0] else "co_condition")
 
+    # Widget nodes + screen→widget edges
+    for wid, w in index.widgets.items():
+        g.add_node(wid, "widget", w.widget_type, file=w.file, lines=str(w.line), condition=w.condition_expression)
+        if w.enclosing_screen:
+            g.add_edge(f"screen:{w.enclosing_screen}", wid, "contains")
+
+    # Hook nodes + screen→hook edges + hook→API/method edges
+    for i, h in enumerate(index.hooks):
+        hid = f"hook:{h.file}:{h.line}:{i}"
+        g.add_node(hid, "hook", f"{h.hook_type}: {h.handler_method}", file=h.file, lines=str(h.line))
+        if h.enclosing_screen:
+            screen_id = f"screen:{h.enclosing_screen}"
+            g.add_edge(screen_id, hid, "triggers")
+            # Extract method name from handler like "cubit.cancelOrder(order.id)"
+            handler = h.handler_method
+            if '(' in handler:
+                handler = handler.split('(')[0]
+            if '.' in handler:
+                handler = handler.split('.')[-1]
+            handler = handler.strip()
+            for api in index.api_calls:
+                if api.client_method == handler:
+                    aid = f"api:{api.method} {api.path_template}"
+                    g.add_edge(hid, aid, "calls_api")
+            # Link hook → cubit/bloc method
+            for sid, sym in index.symbols.items():
+                if sym.kind == "method" and sym.name == handler:
+                    g.add_edge(hid, sid, "invokes")
+
+    # Widget→Hook linkage: link hooks contained within widgets in same screen
+    for wid, w in index.widgets.items():
+        if w.enclosing_screen:
+            screen_id = f"screen:{w.enclosing_screen}"
+            for i, h in enumerate(index.hooks):
+                if h.enclosing_screen == w.enclosing_screen and h.file == w.file:
+                    hid = f"hook:{h.file}:{h.line}:{i}"
+                    # Link widget→hook if hook comes after widget line
+                    if h.line >= w.line:
+                        g.add_edge(wid, hid, "triggers_hook")
+
+    # Service (Method) → API edges: client method in API calls
+    for api in index.api_calls:
+        if api.client_method:
+            aid = f"api:{api.method} {api.path_template}"
+            mid = f"method:{api.client_method}"
+            if mid in g.nodes:
+                g.add_edge(mid, aid, "calls_api")
+
     return g
